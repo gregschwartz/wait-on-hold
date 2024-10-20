@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024, Daily
+# Copyright (c) 2024, Greg Schwartz
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -35,13 +35,15 @@ logger.remove(0)
 logger.add(sys.stderr, level="DEBUG")
 
 
-phone_number = "+12012345678"
+phone_number = "+19492448038"
 
 
 
 async def main():
-    global task
     async with aiohttp.ClientSession() as session:
+        global runner
+        runner = None
+
         (room_url, token) = await configure(session)
 
         transport = DailyTransport(
@@ -63,38 +65,40 @@ async def main():
             api_key=os.getenv("CARTESIA_API_KEY"),
             #
             # voice_id="a0e99841-438c-4a64-b679-ae501e7d6091", # Barbershop man
-            # voice_id="36b42fcb-60c5-4bec-b077-cb1a00a92ec6",  # British pilot over intercom, butler
+            voice_id="36b42fcb-60c5-4bec-b077-cb1a00a92ec6",  # British pilot over intercom, butler
             # voice_id="bf991597-6c13-47e4-8411-91ec2de5c466",  # Scarlett Johansson
-            voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British woman
+            # voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British woman
         )
 
         messages = [
             {
                 "role": "system",
-                #
-                # English
-                #
-                # "content": "You are Chatbot, a friendly, helpful robot. Your goal is to demonstrate your capabilities in a succinct way. Your output will be converted to audio so don't include special characters in your answers. Respond to what the user said in a creative and helpful way, but keep your responses brief. Start by introducing yourself. Keep all your response to 12 words or fewer.",
-                "content": "You are my assistant. We are making a phone call and waiting on hold. Your Job is to not say anything until we are actually talking to a human. You can tell that we are talking to a human because they will say things like 'hi, my name is [name], how can I help you?' or 'thank you for calling, how can I help you today?' Then call tool haveHuman() to let me know that we are talking to a human."
-                # Once we are talking to a human, Tell them that you are grabbing your boss, to hang on one moment, and apologize for the delay. Do your best to keep them on the phone until I take over. Keep all your response to 12 words or fewer.
-                #
-                # Spanish
-                #
-                # "content": "Eres Chatbot, un amigable y útil robot. Tu objetivo es demostrar tus capacidades de una manera breve. Tus respuestas se convertiran a audio así que nunca no debes incluir caracteres especiales. Contesta a lo que el usuario pregunte de una manera creativa, útil y breve. Empieza por presentarte a ti mismo.",
-
+                "content": "You are my assistant. I'm making a phone call to a call center, and waiting on hold. Say hello and that you are waiting on hold for me. After that YOUR JOB IS TO only SAY '...' or '!' Listen for when we are talking to a human at the call center, and say '!'. To anything else you respond '...'. You can tell that we are talking to a human at the call center because they will say things like 'hi, my name is [name], how can I help you?' or 'thank you for calling, how can I help you today?' Only call tool call_center_human_answered(true) when a human at the call center is there, never call it otherwise. Remember, after your first Statement never say anything other than '...' or '!'."
+                # 
+                # Once we are talking to a human, Tell them that you are grabbing your boss, to hang on one moment, and apologize for the delay. Do your best to keep them on the phone until I take over. Your output will be converted to audio so don't include special characters in your answers. Keep all your response to 12 words or fewer.
             },
         ]
 
         ##################
         # Function call to hand off to user
         ##################
-        async def have_human(function_name, tool_call_id, args, llm, context, result_callback):
-            logger.info("have_human on the line, LLM can stop")
-            logger.info(f"does task exist? It should! Here it is: {task}")
-            return
+        async def call_center_human_answered(function_name, tool_call_id, args, llm, context, result_callback):
+            logger.debug(f"call_center_human_answered called, function_name: {function_name}, tool_call_id: {tool_call_id}, args: {args}, llm: {llm}, context: {context}")
+
+            if not function_name == "call_center_human_answered":
+                logger.debug("called nonexistent function, so we don't need to do anything")
+                return
+
+            if not args.get("human_agent_has_answered"):
+                logger.debug("human_agent_has_answered is false, so we don't need to do anything")
+                return
+            
+            # logger.warning(f"does task exist? It should! Here it is: {task}")
+            # return
 
             # turn off LLM
-            task.cancel()
+            # task.cancel()
+            await runner.cancel()
 
             # start a new pipeline without LLM
             pipeline = Pipeline(
@@ -105,22 +109,32 @@ async def main():
                     context_aggregator.assistant(),
                 ]
             )
-            task = PipelineTask(pipeline, PipelineParams(allow_interruptions=True))
+            new_task = PipelineTask(pipeline, PipelineParams(allow_interruptions=True))
             logger.info("pipeline created with no LLM")
+            await runner.run(new_task)
 
         tools = [
             ChatCompletionToolParam(
                 type="function",
                 function={
-                    "name": "have_human",
+                    "name": "call_center_human_answered",
                     "description": "Let the user know that we are talking to a human",
-                    "parameters": {},
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "human_agent_has_answered": {
+                                "type": "boolean",
+                                "description": "Whether a human agent has answered the call",
+                            },
+                        },
+                        "required": ["human_agent_has_answered"],
+                    },
                 },
             )
         ]
 
         llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
-        llm.register_function("have_human", have_human)
+        llm.register_function("call_center_human_answered", call_center_human_answered)
         context = OpenAILLMContext(messages, tools)
         context_aggregator = llm.create_context_aggregator(context)
 
@@ -138,10 +152,11 @@ async def main():
         )
 
         task = PipelineTask(pipeline, PipelineParams(allow_interruptions=True))
+        logger.info(f"pipeline created with LLM")
 
         @transport.event_handler("on_first_participant_joined")
         async def on_first_participant_joined(transport, participant):
-            logger.info(f"Participant joined: {participant}, starting phone call")
+            logger.info(f"Participant joined: {participant}, starting phone call to {phone_number}")
 
             # init phone call
             transport.start_dialout(
